@@ -77,16 +77,64 @@ class TestFuncoesAuxiliares(unittest.TestCase):
 
 
 class TestBuscarSerie(unittest.TestCase):
+    def setUp(self):
+        # Não esperar de verdade entre as tentativas: o teste rodaria em segundos.
+        patch = mock.patch.object(extract_bcb.time, "sleep")
+        self.sleep = patch.start()
+        self.addCleanup(patch.stop)
+
     @mock.patch.object(extract_bcb.requests, "get")
     def test_404_significa_sem_dados_no_intervalo(self, get):
         get.return_value = RespostaFalsa(status_code=404)
         self.assertEqual(extract_bcb.buscar_serie(433, "01/09/2026", "29/09/2026"), [])
+        self.assertEqual(get.call_count, 1)  # 404 não é passageiro: sem nova tentativa
 
     @mock.patch.object(extract_bcb.requests, "get")
-    def test_erro_http_e_propagado(self, get):
+    def test_erro_passageiro_seguido_de_sucesso(self, get):
+        get.side_effect = [RespostaFalsa(status_code=502), RespostaFalsa(corpo=DADOS_VALIDOS)]
+
+        dados = extract_bcb.buscar_serie(433, "01/07/2026", "29/09/2026")
+
+        self.assertEqual(dados, DADOS_VALIDOS)
+        self.assertEqual(get.call_count, 2)
+        self.sleep.assert_called_once_with(2)
+
+    @mock.patch.object(extract_bcb.requests, "get")
+    def test_timeout_seguido_de_sucesso(self, get):
+        get.side_effect = [
+            extract_bcb.requests.Timeout("demorou"),
+            RespostaFalsa(corpo=DADOS_VALIDOS),
+        ]
+        self.assertEqual(extract_bcb.buscar_serie(11, "01/09/2026", "29/09/2026"), DADOS_VALIDOS)
+
+    @mock.patch.object(extract_bcb.requests, "get")
+    def test_erro_passageiro_persistente_e_propagado(self, get):
         get.return_value = RespostaFalsa(status_code=503)
+
         with self.assertRaises(extract_bcb.requests.HTTPError):
             extract_bcb.buscar_serie(11, "01/09/2026", "29/09/2026")
+
+        self.assertEqual(get.call_count, extract_bcb.TENTATIVAS)
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [2, 4])
+
+    @mock.patch.object(extract_bcb.requests, "get")
+    def test_falha_de_conexao_persistente_e_propagada(self, get):
+        get.side_effect = extract_bcb.requests.ConnectionError("sem rede")
+
+        with self.assertRaises(extract_bcb.requests.ConnectionError):
+            extract_bcb.buscar_serie(11, "01/09/2026", "29/09/2026")
+
+        self.assertEqual(get.call_count, extract_bcb.TENTATIVAS)
+
+    @mock.patch.object(extract_bcb.requests, "get")
+    def test_erro_definitivo_nao_e_tentado_de_novo(self, get):
+        get.return_value = RespostaFalsa(status_code=400)
+
+        with self.assertRaises(extract_bcb.requests.HTTPError):
+            extract_bcb.buscar_serie(11, "01/09/2026", "29/09/2026")
+
+        self.assertEqual(get.call_count, 1)
+        self.sleep.assert_not_called()
 
     @mock.patch.object(extract_bcb.requests, "get")
     def test_resposta_que_nao_e_lista_falha(self, get):

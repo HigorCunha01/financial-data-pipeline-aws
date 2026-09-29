@@ -13,6 +13,7 @@ termina com erro -- o que dispara o alarme do CloudWatch.
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -33,7 +34,15 @@ SERIES_PADRAO = {
     "dolar": {"codigo": 1, "dias": 30},
 }
 
-TIMEOUT_SEGUNDOS = 30
+TIMEOUT_SEGUNDOS = 20
+
+# A API do SGS às vezes responde 502/503 ou demora demais por alguns
+# segundos. Esses erros passageiros são tentados de novo, com espera
+# crescente (2s, depois 4s), antes de a série ser dada como falha.
+TENTATIVAS = 3
+ESPERA_BASE_SEGUNDOS = 2
+STATUS_TRANSITORIOS = {429, 500, 502, 503, 504}
+
 FUSO_HORARIO = ZoneInfo("America/Sao_Paulo")
 
 _s3_client = None
@@ -67,10 +76,34 @@ def get_date_range(dias, hoje):
     return inicio.strftime("%d/%m/%Y"), hoje.strftime("%d/%m/%Y")
 
 
+def requisitar_com_retentativa(url):
+    for tentativa in range(1, TENTATIVAS + 1):
+        ultima = tentativa == TENTATIVAS
+        try:
+            resposta = requests.get(url, timeout=TIMEOUT_SEGUNDOS)
+        except (requests.ConnectionError, requests.Timeout) as erro:
+            if ultima:
+                raise
+            motivo = type(erro).__name__
+        else:
+            if resposta.status_code not in STATUS_TRANSITORIOS or ultima:
+                return resposta
+            motivo = f"HTTP {resposta.status_code}"
+
+        espera = ESPERA_BASE_SEGUNDOS * 2 ** (tentativa - 1)
+        logger.warning(
+            "tentativa %d/%d falhou (%s); nova tentativa em %ds: %s",
+            tentativa,
+            TENTATIVAS,
+            motivo,
+            espera,
+            url,
+        )
+        time.sleep(espera)
+
+
 def buscar_serie(codigo_serie, data_inicial, data_final):
-    resposta = requests.get(
-        build_url(codigo_serie, data_inicial, data_final), timeout=TIMEOUT_SEGUNDOS
-    )
+    resposta = requisitar_com_retentativa(build_url(codigo_serie, data_inicial, data_final))
 
     # O SGS responde 404 quando não existe nenhum ponto no intervalo pedido.
     if resposta.status_code == 404:

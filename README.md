@@ -99,10 +99,12 @@ O projeto foi construído em duas fases:
   porque a execução diária cai sempre no mesmo horário: com 24h exatas o alarme
   dispararia alguns minutos todo dia, no intervalo entre a execução de ontem sair
   da janela e a métrica da execução de hoje chegar.
-- **Sem retentativa automática**: a Lambda é configurada com 0 retentativas. Uma
-  falha vira alerta na hora, e a execução do dia seguinte já cobre o período perdido,
-  porque a janela de busca é móvel. Com o padrão da AWS (2 retentativas), uma única
-  falha rodaria o pipeline três vezes.
+- **Retentativa no lugar certo**: erros passageiros da API (HTTP 429/5xx, timeout,
+  falha de conexão) são tentados de novo dentro do código, só para a série afetada,
+  até 3 vezes com espera crescente (2s, 4s). Já a retentativa automática da própria
+  Lambda está desligada (0): com o padrão da AWS (2), uma falha rodaria o pipeline
+  inteiro mais duas vezes. Se a série ainda falhar, vira alerta na hora, e a execução
+  do dia seguinte cobre o período perdido, porque a janela de busca é móvel.
 - **FinOps**: limite de 100 MB escaneados por query no workgroup do Athena,
   resultados de query apagados após 7 dias, logs com retenção de 14 dias e tags
   `Project`/`ManagedBy` em todos os recursos para filtrar custo no Cost Explorer.
@@ -173,7 +175,7 @@ ruff check . && ruff format --check .
 ```
 
 Os testes substituem a API do Banco Central e o S3 por dublês, então rodam em
-segundos, sem internet e sem credenciais. Cobrem montagem da URL e da janela de datas,
+segundos, sem internet e sem credenciais. Cobrem montagem da URL e da janela de datas, novas tentativas em erro passageiro,
 tratamento de erros HTTP, resposta `404` do SGS (sem dados no intervalo), o formato
 JSON Lines gravado, o isolamento de falha entre séries e todas as regras de qualidade.
 
@@ -218,6 +220,19 @@ A coluna `data` é texto (`dd/mm/yyyy`), então `ORDER BY` comparava como string
 
 **Correção**: `date_parse(data, '%d/%m/%Y')` para converter em data real antes de
 ordenar (usado na consulta pronta do Athena).
+
+### 4. `502 Server Error: Bad Gateway` intermitente na API do Banco Central (Fase 2)
+
+Numa execução manual logo após o deploy, Selic e dólar foram gravados, mas o IPCA
+falhou com `502 Bad Gateway` — erro do lado do servidor do SGS, que some sozinho em
+seguida. O comportamento já foi o planejado (a série com erro não foi gravada, as
+outras sim, e a execução terminou com erro para disparar o alarme), mas um erro de
+poucos segundos não deveria virar alerta.
+
+**Correção**: nova tentativa com espera crescente (2s, 4s) para erros passageiros
+(HTTP 429, 500, 502, 503, 504, timeout e falha de conexão). Erros definitivos, como
+400 ou o 404 de "sem dados no intervalo", não são repetidos. O timeout da Lambda subiu
+para 300s para acomodar o pior caso.
 
 ## Possíveis evoluções
 

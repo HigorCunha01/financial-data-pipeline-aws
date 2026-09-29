@@ -43,7 +43,7 @@ resource "aws_lambda_function" "extract_bcb" {
   filename         = data.archive_file.extract_bcb.output_path
   source_code_hash = data.archive_file.extract_bcb.output_base64sha256
   layers           = [aws_lambda_layer_version.requests.arn]
-  timeout          = 120 # 3 séries x até 30s de timeout HTTP cada, com folga
+  timeout          = 300 # pior caso: 3 séries x (3 tentativas de 20s + 6s de espera)
   memory_size      = 128
 
   environment {
