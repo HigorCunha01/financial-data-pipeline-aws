@@ -1,0 +1,56 @@
+name: CI
+
+# Roda a cada push na main e em todo Pull Request: garante que nada quebrado
+# (teste falhando, código fora do padrão, Terraform inválido) chegue na main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python (lint + testes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13" # mesmo runtime da Lambda
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Instalar dependências
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Testes (pytest)
+        run: pytest -v
+
+  terraform:
+    name: Terraform (fmt + validate)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Formatação
+        run: terraform fmt -check -recursive
+
+      # -backend=false: valida o código sem precisar de credenciais AWS nem de state.
+      - name: Init
+        run: terraform init -backend=false
+
+      - name: Validate
+        run: terraform validate

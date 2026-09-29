@@ -1,0 +1,3 @@
+# Dependência de runtime da Lambda, empacotada como Lambda Layer
+# (ver terraform/build_layer.ps1 ou terraform/build_layer.sh).
+requests==2.33.1

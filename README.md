@@ -1,111 +1,194 @@
 # 💰 Pipeline Serverless de Dados Financeiros — AWS
 
-Pipeline de dados serverless que extrai indicadores econômicos (Selic, IPCA e câmbio)
-da API pública do Banco Central do Brasil, e disponibiliza os dados para consulta via
-SQL, sem nenhum banco de dados tradicional rodando — usando S3, Glue e Athena.
+![CI](https://github.com/HigorCunha01/financial-data-pipeline-aws/actions/workflows/ci.yml/badge.svg)
 
-Projeto construído do zero, com apoio de mentoria guiada, como parte da minha
-transição para Engenharia de Dados, aplicando Python e os principais serviços de
-dados da AWS em uma arquitetura completa de ponta a ponta.
+Pipeline de dados serverless que extrai indicadores econômicos (Selic, IPCA e câmbio)
+da API pública do Banco Central do Brasil, valida a qualidade do dado e o
+disponibiliza para consulta via SQL — sem nenhum banco de dados tradicional rodando,
+usando S3, Glue Data Catalog e Athena.
+
+O projeto foi construído em duas fases:
+
+- **Fase 1 — manual**: toda a arquitetura montada pelo console da AWS, para aprender
+  cada serviço na prática (Lambda, Layers, S3, Glue Crawler, Athena, IAM).
+- **Fase 2 — IaC + DataOps**: a mesma arquitetura reescrita em **Terraform**, agora
+  rodando sozinha todo dia (**EventBridge Scheduler**), com **validação de qualidade
+  de dado**, **alertas por e-mail** (CloudWatch + SNS), **testes automatizados**
+  (pytest) e **CI no GitHub Actions**.
 
 ## Arquitetura
 
 ```
-                 ┌──────────────────────────┐
-                 │  API do Banco Central     │  (SGS — séries temporais, sem API key)
-                 │  (Selic, IPCA, Dólar)     │
-                 └────────────┬──────────────┘
-                              │  requests (Python, dentro da AWS Lambda)
-                              ▼
-                 ┌──────────────────────────┐
-                 │  Amazon S3                │  raw/serie=<nome>/data_execucao=<data>/
-                 │  (JSON Lines particionado)│  dados.json
-                 └────────────┬──────────────┘
-                              │  AWS Glue Crawler
-                              ▼
-                 ┌──────────────────────────┐
-                 │  Glue Data Catalog        │  database: financial_data
-                 │  (schema inferido)        │  tabela: raw
-                 └────────────┬──────────────┘
-                              │  SQL
-                              ▼
-                 ┌──────────────────────────┐
-                 │  Amazon Athena             │  consultas SQL direto sobre o S3
-                 └──────────────────────────┘
-
-Orquestração planejada: Amazon EventBridge Scheduler → Lambda (execução diária)
+  ┌──────────────────────────┐
+  │ EventBridge Scheduler     │  todo dia, 09:00 (America/Sao_Paulo)
+  └────────────┬──────────────┘
+               ▼
+  ┌──────────────────────────┐        ┌──────────────────────────┐
+  │ AWS Lambda  extract-bcb   │ ─────► │ API do Banco Central (SGS)│
+  │ + Layer (requests)        │ ◄───── │ Selic, IPCA, Dólar        │
+  │                           │        └──────────────────────────┘
+  │ validação de qualidade    │
+  └──────┬─────────────┬──────┘
+         │ dado válido │ erro / dado inválido / não rodou
+         ▼             ▼
+  ┌───────────────┐  ┌──────────────────────────┐
+  │ Amazon S3      │  │ CloudWatch Alarms → SNS   │ ──► e-mail de alerta
+  │ raw/serie=.../ │  └──────────────────────────┘
+  │ data_execucao= │
+  └──────┬─────────┘
+         ▼
+  ┌──────────────────────────┐
+  │ Glue Data Catalog         │  tabela declarada em Terraform +
+  │ database financial_data   │  partition projection (sem crawler)
+  └────────────┬──────────────┘
+               ▼
+  ┌──────────────────────────┐
+  │ Amazon Athena             │  workgroup com limite de custo por query
+  └──────────────────────────┘
 ```
 
 ## Stack
 
 | Camada           | Ferramenta                                  |
-|------------------|-----------------------------------------------|
-| Extração         | Python (`requests`, `boto3`) rodando em AWS Lambda |
-| Empacotamento    | AWS Lambda Layers (dependência `requests` separada do código) |
-| Armazenamento    | Amazon S3 (particionado, formato JSON Lines) |
-| Catalogação      | AWS Glue (Crawler + Data Catalog)            |
-| Consulta         | Amazon Athena (SQL sobre S3, sem banco tradicional) |
-| Permissões       | IAM (roles e policies por serviço, menor privilégio) |
+|------------------|---------------------------------------------|
+| Infraestrutura   | Terraform (IaC)                              |
+| Agendamento      | Amazon EventBridge Scheduler                 |
+| Extração         | Python (`requests`) em AWS Lambda            |
+| Empacotamento    | AWS Lambda Layers (dependência separada do código) |
+| Qualidade de dado| Validações em Python antes de gravar no S3   |
+| Armazenamento    | Amazon S3 (particionado, JSON Lines)         |
+| Catalogação      | AWS Glue Data Catalog (partition projection) |
+| Consulta         | Amazon Athena                                |
+| Monitoramento    | CloudWatch Logs + Alarms, Amazon SNS         |
+| Testes / CI      | pytest, ruff, GitHub Actions                 |
+| Permissões       | IAM com menor privilégio por serviço         |
 
 ## Por que essas escolhas
 
-- **Serverless em vez de servidor fixo**: nenhuma infraestrutura fica ligada 24h —
-  o Lambda só executa quando disparado, e o Athena só "existe" na hora da query.
-  Toda a stack usada aqui está dentro da camada gratuita da AWS (Always Free / S3 e Lambda).
-- **Particionamento por série e data** (`serie=selic/data_execucao=2026-08-27/`):
-  reduz o volume de dado escaneado a cada consulta no Athena — que cobra por dado
-  escaneado, então particionamento mal pensado é literalmente dinheiro jogado fora
-  em produção.
-- **JSON Lines em vez de array JSON**: formato em que cada linha do arquivo é um
-  registro independente, permitindo que o Glue Crawler infira colunas reais
-  (`data`, `valor`) em vez de uma única coluna do tipo `array` (ver Troubleshooting).
-- **Lambda Layer para a dependência `requests`**: separa "código de negócio" de
-  "biblioteca de terceiro", permitindo reaproveitar a mesma layer em futuras funções
-  Lambda sem reempacotar nada.
-- **IAM com Roles específicas por serviço**: cada serviço (Lambda, Glue) tem sua
-  própria Role, seguindo o princípio do menor privilégio — nenhuma credencial de
-  usuário é usada em tempo de execução.
+- **Serverless em vez de servidor fixo**: nada fica ligado 24h. A Lambda só roda
+  quando o agendamento dispara, e o Athena só cobra na hora da query.
+- **Particionamento por série e data** (`serie=selic/data_execucao=2026-09-29/`):
+  reduz o volume escaneado a cada consulta no Athena — que cobra por dado lido.
+- **JSON Lines em vez de array JSON**: um registro por linha, o que permite ler
+  colunas reais (`data`, `valor`) em vez de uma única coluna `array`
+  (ver Troubleshooting #1).
+- **Lambda Layer para `requests`**: separa "código de negócio" de "biblioteca de
+  terceiro". O script `build_layer` baixa os pacotes compilados para Linux, então
+  a layer funciona mesmo gerada no Windows.
+- **Partition projection em vez de Glue Crawler**: na Fase 1, um crawler inferia o
+  schema e registrava as partições. Aqui o schema é declarado em código e o Athena
+  calcula as partições sozinho a partir do padrão do caminho. Resultado: partição
+  nova fica consultável na hora, schema versionado no Git e **custo zero** — um
+  crawler rodando todo dia custaria alguns dólares por mês (cobrança mínima de 10
+  minutos de DPU por execução).
+- **Validação de qualidade dentro da Lambda**: cada série é checada antes de ir para
+  o S3 (lista não vazia, campos obrigatórios, data no formato `dd/mm/aaaa`, valor
+  numérico e finito, sem datas duplicadas). Série reprovada **não é gravada** e a
+  execução termina com erro — o que dispara o alarme. Uma série com problema não
+  impede as outras de serem gravadas. Optei por checagens próprias em vez de Great
+  Expectations porque o volume é pequeno e a dependência pesaria na Lambda.
+- **Janela de busca por série**: o IPCA é mensal (data de referência no dia 1º,
+  publicado por volta do dia 10 do mês seguinte), então uma janela de 30 dias pode
+  não conter nenhum ponto. Cada série tem sua própria janela (`dias`): 30 para Selic
+  e dólar, 90 para IPCA. Uma resposta sem dados — inclusive o `404` que o SGS
+  devolve quando o intervalo está vazio — é reprovada pela validação com mensagem
+  clara, em vez de gerar um arquivo vazio no S3.
+- **Dois alarmes, não um**: um para quando a extração **falha** e outro para quando
+  ela **simplesmente não roda** por mais de 26h — o tipo de falha silenciosa que
+  costuma passar despercebida por dias. A janela é de 26h, e não 24h cravadas,
+  porque a execução diária cai sempre no mesmo horário: com 24h exatas o alarme
+  dispararia alguns minutos todo dia, no intervalo entre a execução de ontem sair
+  da janela e a métrica da execução de hoje chegar.
+- **Sem retentativa automática**: a Lambda é configurada com 0 retentativas. Uma
+  falha vira alerta na hora, e a execução do dia seguinte já cobre o período perdido,
+  porque a janela de busca é móvel. Com o padrão da AWS (2 retentativas), uma única
+  falha rodaria o pipeline três vezes.
+- **FinOps**: limite de 100 MB escaneados por query no workgroup do Athena,
+  resultados de query apagados após 7 dias, logs com retenção de 14 dias e tags
+  `Project`/`ManagedBy` em todos os recursos para filtrar custo no Cost Explorer.
+- **IAM com menor privilégio**: a Lambda só pode fazer `s3:PutObject` dentro de
+  `raw/` e escrever logs no próprio log group (em vez da policy gerenciada
+  `AWSLambdaBasicExecutionRole`, que libera qualquer log group da conta); o
+  Scheduler só pode invocar essa Lambda específica, e só a partir desta conta.
 
-## Como funciona (fluxo de execução)
+## Estrutura do repositório
 
-1. A função Lambda (`extract_bcb.py`) é executada, buscando os últimos 30 dias de
-   3 séries do Banco Central (Selic, IPCA, Dólar).
-2. Cada série é salva como um arquivo `dados.json` no S3, em formato JSON Lines,
-   dentro de um caminho particionado por série e data de execução.
-3. O AWS Glue Crawler varre o bucket, infere o schema automaticamente e popula o
-   Glue Data Catalog (database `financial_data`, tabela `raw`).
-4. Consultas SQL são feitas diretamente no Amazon Athena, sem necessidade de
-   carregar os dados em nenhum banco de dados.
-
-## Reproduzindo a Lambda Layer localmente
-
-A pasta `lambda_layer/` (com as dependências instaladas) não é versionada — ela é
-100% reproduzível a partir do `requirements.txt`:
-
-```bash
-mkdir -p lambda_layer/python
-pip install requests -t lambda_layer/python
-cd lambda_layer
-zip -r requests-layer.zip python
+```
+lambda/
+  extract_bcb.py        # handler da Lambda: busca, valida e grava cada série
+  data_quality.py       # regras de qualidade de dado
+tests/                  # testes unitários (sem acessar internet nem AWS)
+terraform/              # toda a infraestrutura
+  build_layer.ps1/.sh   # gera a Lambda Layer com as dependências
+.github/workflows/ci.yml
+requirements.txt        # dependências da Lambda (vão para a layer)
+requirements-dev.txt    # + pytest e ruff
 ```
 
-O `.zip` gerado é o que deve ser enviado como uma nova versão da Lambda Layer no
-console AWS (Lambda → Layers → Create layer), com runtime compatível com Python 3.x.
+## Deploy com Terraform
 
-## Deploy (manual, via console AWS)
+Pré-requisitos: [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.5,
+Python 3 com `pip` e AWS CLI configurado (`aws configure`) com permissão para criar os
+recursos (S3, Lambda, IAM, Glue, Athena, EventBridge Scheduler, CloudWatch, SNS).
 
-Este projeto foi implantado manualmente pelo console da AWS, como parte do
-aprendizado da plataforma. Os passos gerais:
+```powershell
+cd terraform
 
-1. Criar um bucket S3 para os dados brutos.
-2. Criar a função Lambda (`extract_bcb.py`), anexando a Lambda Layer com `requests`.
-3. Configurar a execution role da Lambda com permissão de escrita no bucket S3.
-4. Criar um AWS Glue Crawler apontando para o caminho `s3://<bucket>/raw/`,
-   com uma IAM Role própria (permissão de leitura no S3 + escrita no Glue Catalog).
-5. Rodar o Crawler e consultar os dados no Amazon Athena.
+# 1. Variáveis: seu e-mail de alerta
+copy terraform.tfvars.example terraform.tfvars   # depois edite o e-mail
 
-> Próxima evolução planejada: reescrever esse deploy como Infrastructure as Code
-> (Terraform), e automatizar a execução periódica com Amazon EventBridge Scheduler.
+# 2. Gerar a Lambda Layer (requests compilado para Linux)
+powershell -ExecutionPolicy Bypass -File .\build_layer.ps1   # Windows
+# ./build_layer.sh                                           # Linux/macOS
+
+# 3. Criar a infraestrutura
+terraform init
+terraform plan
+terraform apply
+```
+
+Depois do `apply`:
+
+1. **Confirme a assinatura do SNS** no e-mail que chega da AWS — sem isso os alertas
+   não são entregues.
+2. **Rode a extração uma vez** para não esperar o agendamento:
+
+   ```powershell
+   aws lambda invoke --function-name extract-bcb-tf out.json
+   type out.json
+   ```
+
+3. No console do **Athena**, selecione o workgroup `financial-data-tf` e o database
+   `financial_data_tf`. Em *Saved queries* está pronta a consulta
+   `ultimos-valores-por-serie`.
+
+Para remover tudo: `terraform destroy`.
+
+## Testes e CI
+
+```bash
+pip install -r requirements-dev.txt
+pytest -v
+ruff check . && ruff format --check .
+```
+
+Os testes substituem a API do Banco Central e o S3 por dublês, então rodam em
+segundos, sem internet e sem credenciais. Cobrem montagem da URL e da janela de datas,
+tratamento de erros HTTP, resposta `404` do SGS (sem dados no intervalo), o formato
+JSON Lines gravado, o isolamento de falha entre séries e todas as regras de qualidade.
+
+A cada push na `main` e em todo Pull Request, o **GitHub Actions** roda lint, testes,
+`terraform fmt -check` e `terraform validate`.
+
+## Limitações conhecidas
+
+- **Duplicidade na camada raw**: como cada execução busca uma janela móvel (30 dias
+  para Selic e dólar, 90 para IPCA), o mesmo ponto aparece em várias partições
+  `data_execucao`. Por isso a consulta pronta filtra a execução mais recente. A
+  solução definitiva é uma camada tratada (silver) deduplicada — tema do próximo
+  projeto do portfólio (Lakehouse com PySpark).
+- O alarme de "não rodou" pode disparar logo após o primeiro deploy, antes da
+  primeira execução. Rodar a Lambda uma vez manualmente (passo 2 acima) evita isso.
 
 ## Troubleshooting — problemas reais encontrados e resolvidos
 
@@ -116,37 +199,37 @@ salvo dessa forma no S3, o Glue Crawler não consegue "explodir" o array em colu
 ele cria uma única coluna do tipo `array`, inutilizável em queries simples.
 
 **Correção**: o código transforma a lista em **JSON Lines** antes de salvar (um
-objeto JSON por linha, sem colchetes envolvendo tudo). O Glue Crawler então infere
-corretamente as colunas `data` e `valor`.
+objeto JSON por linha, sem colchetes envolvendo tudo).
 
-### 2. `dbt1005` / `Service is unable to assume provided role. Please verify role's TrustPolicy`
+### 2. `Service is unable to assume provided role. Please verify role's TrustPolicy` (Fase 1)
 
-Ao criar o Glue Crawler pelo próprio wizard do console AWS (opção "Create default
-role"), a criação da IAM Role falhava silenciosamente — a Role nunca chegava a
-existir de fato, mesmo sem erro aparente na hora da criação.
+Ao criar o Glue Crawler pelo wizard do console AWS (opção "Create default role"), a
+criação da IAM Role falhava silenciosamente — a Role nunca chegava a existir.
 
-**Causa raiz**: o usuário IAM usado não tinha permissão para criar Roles (`IAMFullAccess`
-ausente). Mesmo depois de corrigir essa permissão, o wizard do Glue continuou
-falhando nesse fluxo específico — contornado criando a Role manualmente pelo
-console IAM (Serviço confiável: Glue, política `AWSGlueServiceRole` +
-`AmazonS3ReadOnlyAccess`) e selecionando "Use another role" na tela do Crawler.
+**Causa raiz**: o usuário IAM usado não tinha permissão para criar Roles. Mesmo depois
+de corrigir, o wizard continuou falhando nesse fluxo — contornado criando a Role
+manualmente pelo console IAM e selecionando "Use another role" no Crawler. Na Fase 2
+esse problema deixa de existir: as roles são declaradas em Terraform.
 
 ### 3. `ORDER BY data DESC` retornando ordem incorreta no Athena
 
-A coluna `data` é armazenada como texto (`dd/mm/yyyy`), então `ORDER BY` comparava
-os valores como string (ordenação lexicográfica), não como data real — por exemplo,
+A coluna `data` é texto (`dd/mm/yyyy`), então `ORDER BY` comparava como string —
 `"31/07/2026"` era considerado "maior" que `"05/08/2026"`.
 
-**Correção**: uso da função `date_parse(data, '%d/%m/%Y')` dentro do `ORDER BY`,
-convertendo o texto para um tipo `date` real antes de ordenar.
+**Correção**: `date_parse(data, '%d/%m/%Y')` para converter em data real antes de
+ordenar (usado na consulta pronta do Athena).
 
 ## Possíveis evoluções
 
-- [ ] Reescrever a infraestrutura como código (Terraform), em vez de configuração manual via console
-- [ ] Automatizar a execução periódica com Amazon EventBridge Scheduler
-- [ ] Adicionar testes de qualidade de dado (ex: Great Expectations) antes da catalogação
-- [ ] Pipeline de CI/CD (GitHub Actions) para validar e empacotar a função Lambda automaticamente
-- [ ] Adicionar mais séries econômicas (basta editar o dicionário `SERIES` em `extract_bcb.py`)
+- [x] Reescrever a infraestrutura como código (Terraform)
+- [x] Automatizar a execução periódica com Amazon EventBridge Scheduler
+- [x] Validação de qualidade de dado antes de gravar
+- [x] CI no GitHub Actions (lint, testes, validação do Terraform)
+- [x] Alertas de falha e de "não execução"
+- [ ] Deploy contínuo (`terraform apply` pelo GitHub Actions com OIDC, sem chave de acesso)
+- [ ] State remoto do Terraform (S3 + lock) para trabalhar de mais de uma máquina
+- [ ] Camada silver deduplicada e em Parquet
+- [ ] Mais séries econômicas (basta adicionar em `series`, no `terraform.tfvars`)
 
 ## Autor
 

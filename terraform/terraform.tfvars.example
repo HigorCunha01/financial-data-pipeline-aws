@@ -1,0 +1,13 @@
+# Copie este arquivo para terraform.tfvars e preencha com seus dados.
+# terraform.tfvars NÃO é versionado (está no .gitignore) -- fica só na sua máquina.
+
+alert_email = "seu-email@exemplo.com"
+
+# Opcional: sobrescreva os padrões de variables.tf se quiser.
+# schedule_expression = "cron(0 9 * * ? *)"
+# series = {
+#   selic = { codigo = 11, dias = 30 }
+#   ipca  = { codigo = 433, dias = 90 }
+#   dolar = { codigo = 1, dias = 30 }
+#   igpm  = { codigo = 189, dias = 90 }
+# }

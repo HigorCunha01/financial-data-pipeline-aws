@@ -1,0 +1,4 @@
+# Dependências para rodar testes e lint localmente e no CI.
+-r requirements.txt
+pytest>=8
+ruff>=0.6
